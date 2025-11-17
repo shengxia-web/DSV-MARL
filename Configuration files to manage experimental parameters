@@ -1,0 +1,84 @@
+# experiment_config.py
+"""
+对比实验配置文件
+"""
+
+EXPERIMENT_CONFIG = {
+    # 实验基础配置
+    'experiment_name': 'DSV-MARL Comparative Study',
+    'num_seeds': 10,
+    'num_episodes': 1000,
+    'eval_frequency': 50,
+    
+    # 环境配置
+    'environment': {
+        'num_agents': 5,
+        'state_dim': 50,
+        'action_dim': 3,
+        'max_steps': 100,
+        'business_scenarios': ['financial_risk_control', 'ecommerce_recommendation', 'medical_diagnosis']
+    },
+    
+    # 模型配置
+    'models': {
+        'StaticShapley': {
+            'shapley_samples': 1000,
+            'computation_method': 'exact'  # or 'monte_carlo'
+        },
+        'IQL': {
+            'learning_rate': 1e-4,
+            'gamma': 0.99,
+            'epsilon_start': 1.0,
+            'epsilon_end': 0.01,
+            'epsilon_decay': 0.995,
+            'buffer_size': 10000,
+            'batch_size': 32
+        },
+        'VDN': {
+            'mixing_hidden_dim': 64,
+            'learning_rate': 1e-4,
+            'gamma': 0.99,
+            'buffer_size': 10000,
+            'batch_size': 32
+        },
+        'COMA': {
+            'critic_hidden_dim': 128,
+            'learning_rate_actor': 1e-4,
+            'learning_rate_critic': 1e-3,
+            'gamma': 0.99,
+            'lambda_': 0.95,
+            'entropy_coef': 0.01
+        },
+        'DSV-MARL': {
+            'shapley_temperature': 0.5,
+            'monte_carlo_samples': 100,
+            'learning_rate_actor': 1e-4,
+            'learning_rate_critic': 1e-3,
+            'learning_rate_shapley': 1e-3,
+            'gamma': 0.99,
+            'entropy_coef': 0.01,
+            'value_coef': 0.5,
+            'clip_grad_norm': 0.5
+        }
+    },
+    
+    # 评估指标配置
+    'evaluation_metrics': {
+        'primary': ['spearman_correlation', 'mae', 'mse'],
+        'secondary': ['gini_coefficient', 'coefficient_of_variation', 'convergence_episodes'],
+        'fairness': ['contribution_equality', 'reward_distribution']
+    },
+    
+    # 可视化配置
+    'visualization': {
+        'save_format': 'png',
+        'dpi': 300,
+        'style': 'seaborn',
+        'color_palette': 'Set2'
+    }
+}
+
+
+
+
+
