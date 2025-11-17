@@ -1,0 +1,168 @@
+# component_analysis.py
+"""
+组件贡献深度分析工具
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+import json
+
+class ComponentAnalysis:
+    """组件贡献深度分析器"""
+    
+    def __init__(self, ablation_results_file: str):
+        self.results_file = ablation_results_file
+        self.results = self.load_results()
+        
+    def load_results(self):
+        """加载消融实验结果"""
+        with open(self.results_file, 'r') as f:
+            return json.load(f)
+    
+    def calculate_relative_importance(self) -> Dict[str, float]:
+        """
+        计算各组件的相对重要性
+        基于性能下降的程度
+        """
+        complete_performance = self.results['results_summary']['Complete_DSV-MARL']['mean']
+        component_importance = {}
+        
+        for model_name, summary in self.results['results_summary'].items():
+            if model_name == 'Complete_DSV-MARL':
+                continue
+                
+            # 计算综合性能下降
+            performance_drops = []
+            for metric in ['spearman_correlation', 'mae', 'mse']:
+                complete_val = complete_performance.get(metric, 0)
+                ablation_val = summary['mean'].get(metric, 0)
+                
+                if 'correlation' in metric:
+                    drop = (complete_val - ablation_val) / complete_val
+                else:
+                    drop = (ablation_val - complete_val) / complete_val
+                
+                performance_drops.append(drop)
+            
+            # 平均性能下降作为重要性指标
+            avg_drop = np.mean(performance_drops)
+            component_importance[model_name] = avg_drop * 100  # 转换为百分比
+        
+        return component_importance
+    
+    def analyze_interaction_effects(self) -> Dict[str, Any]:
+        """
+        分析组件间的交互效应
+        """
+        interaction_analysis = {}
+        
+        # 收集各消融版本的性能数据
+        performance_data = {}
+        for model_name, summary in self.results['results_summary'].items():
+            performance_data[model_name] = summary['mean']
+        
+        # 分析组件组合的影响
+        # 这里可以添加更复杂的交互效应分析
+        
+        return interaction_analysis
+    
+    def perform_sensitivity_analysis(self) -> Dict[str, Any]:
+        """
+        执行敏感性分析
+        评估各组件对模型性能的敏感度
+        """
+        sensitivity_results = {}
+        
+        complete_performance = self.results['results_summary']['Complete_DSV-MARL']['mean']
+        
+        for model_name, summary in self.results['results_summary'].items():
+            if model_name == 'Complete_DSV-MARL':
+                continue
+                
+            sensitivity_scores = {}
+            for metric in ['spearman_correlation', 'mae', 'mse']:
+                complete_val = complete_performance.get(metric, 0)
+                ablation_val = summary['mean'].get(metric, 0)
+                
+                # 计算敏感性得分
+                if 'correlation' in metric:
+                    sensitivity = (complete_val - ablation_val) / complete_val
+                else:
+                    sensitivity = (ablation_val - complete_val) / complete_val
+                
+                sensitivity_scores[metric] = sensitivity
+            
+            sensitivity_results[model_name] = sensitivity_scores
+        
+        return sensitivity_results
+    
+    def generate_comprehensive_analysis(self, output_file: str = 'component_analysis_report.md'):
+        """
+        生成全面的组件分析报告
+        """
+        # 计算各项分析结果
+        importance_scores = self.calculate_relative_importance()
+        sensitivity_scores = self.perform_sensitivity_analysis()
+        
+        report = f"""# Component Contribution Analysis Report
+
+## Overview
+Based on ablation study results from: {self.results['timestamp']}
+
+## Relative Importance of Components
+
+Component importance (based on performance degradation when removed):
+
+"""
+        
+        # 按重要性排序
+        sorted_importance = sorted(importance_scores.items(), key=lambda x: x[1], reverse=True)
+        for component, importance in sorted_importance:
+            report += f"- **{component}**: {importance:.2f}% performance impact\n"
+        
+        report += "\n## Sensitivity Analysis\n\n"
+        report += "Sensitivity of performance metrics to component removal:\n\n"
+        
+        for component, sensitivities in sensitivity_scores.items():
+            report += f"### {component}\n"
+            for metric, sensitivity in sensitivities.items():
+                report += f"- {metric}: {sensitivity:.3f}\n"
+            report += "\n"
+        
+        # 添加关键发现
+        report += "## Key Findings\n\n"
+        
+        most_important = max(importance_scores.items(), key=lambda x: x[1])
+        least_important = min(importance_scores.items(), key=lambda x: x[1])
+        
+        report += f"- **Most critical component**: {most_important[0]} ({most_important[1]:.2f}% impact)\n"
+        report += f"- **Least critical component**: {least_important[0]} ({least_important[1]:.2f}% impact)\n"
+        
+        # 保存报告
+        with open(output_file, 'w') as f:
+            f.write(report)
+        
+        print(f"Component analysis report saved to {output_file}")
+        
+        return {
+            'importance_scores': importance_scores,
+            'sensitivity_scores': sensitivity_scores
+        }
+
+# 使用示例
+if __name__ == "__main__":
+    analyzer = ComponentAnalysis('ablation_results/ablation_report.json')
+    
+    # 执行全面分析
+    analysis_results = analyzer.generate_comprehensive_analysis()
+    print("Component analysis completed")
+    
+    # 显示关键结果
+    print("\n=== Key Component Analysis Results ===")
+    for component, importance in analysis_results['importance_scores'].items():
+        print(f"{component}: {importance:.2f}% importance")
+
+
+
