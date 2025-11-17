@@ -1,0 +1,209 @@
+# config.py
+"""
+Youe Data Network 爬虫配置文件
+"""
+
+CRAWLER_CONFIG = {
+    # 基础配置
+    'base_url': 'https://www.youedata.com',
+    'max_pages': 100,  # 最大爬取页数
+    'page_size': 50,   # 每页记录数
+    'request_delay': 1.5,  # 请求延迟（秒）
+    
+    # 请求头
+    'headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    },
+    
+    # 数据保存配置
+    'output_directory': 'youe_data',
+    'save_formats': ['json', 'csv'],
+    
+    # 数据验证配置
+    'required_fields': ['asset_id', 'asset_name', 'data_type', 'provider'],
+    'quality_threshold': 0.6,
+    
+    # 重试配置
+    'max_retries': 3,
+    'retry_delay': 5,
+}
+
+# 数据字段映射（根据实际API响应调整）
+FIELD_MAPPING = {
+    'id': 'asset_id',
+    'name': 'asset_name',
+    'dataType': 'data_type',
+    'createTime': 'create_time',
+    'updateTime': 'update_time',
+    'price': 'historical_price',
+    'transactionCount': 'transaction_count',
+    'viewCount': 'view_count',
+}
+
+
+
+
+
+
+# data_preprocessing.py
+"""
+数据预处理脚本
+用于将原始爬取数据转换为论文中描述的结构化格式
+"""
+
+import pandas as pd
+import numpy as np
+from typing import Dict, List
+import json
+
+class YoueDataPreprocessor:
+    """Youe数据预处理类"""
+    
+    def __init__(self):
+        self.business_scenarios = {
+            'financial_risk_control': ['信用', '风险', '欺诈', '贷款', '金融'],
+            'ecommerce_recommendation': ['推荐', '电商', '用户', '购买', '消费'],
+            'medical_diagnosis': ['医疗', '健康', '诊断', '病历', '疾病']
+        }
+    
+    def load_raw_data(self, json_file_path: str) -> pd.DataFrame:
+        """加载原始JSON数据"""
+        with open(json_file_path, 'r', encoding='utf-8') as f:
+            raw_data = json.load(f)
+        
+        return pd.DataFrame(raw_data)
+    
+    def preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        执行完整的数据预处理流程
+        """
+        # 1. 数据清洗
+        df_clean = self.clean_data(df)
+        
+        # 2. 特征工程
+        df_features = self.feature_engineering(df_clean)
+        
+        # 3. 业务场景标注
+        df_labeled = self.label_business_scenarios(df_features)
+        
+        # 4. 数据标准化
+        df_final = self.normalize_data(df_labeled)
+        
+        return df_final
+    
+    def clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """数据清洗"""
+        df_clean = df.copy()
+        
+        # 处理缺失值
+        numeric_columns = ['historical_price', 'transaction_count', 'view_count'] + \
+                         [f'{field}_score' for field in ['completeness', 'accuracy', 'timeliness', 
+                                                        'consistency', 'availability', 'scarcity', 'compliance']]
+        
+        for col in numeric_columns:
+            if col in df_clean.columns:
+                df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
+                df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+        
+        # 处理文本字段
+        text_columns = ['asset_name', 'description', 'provider']
+        for col in text_columns:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col].fillna('Unknown')
+        
+        # 删除完全空白的行
+        df_clean = df_clean.dropna(how='all')
+        
+        return df_clean
+    
+    def feature_engineering(self, df: pd.DataFrame) -> pd.DataFrame:
+        """特征工程"""
+        df_feat = df.copy()
+        
+        # 计算综合质量评分
+        quality_columns = [f'{field}_score' for field in 
+                          ['completeness', 'accuracy', 'timeliness', 'consistency', 
+                           'availability', 'scarcity', 'compliance']]
+        
+        existing_quality_cols = [col for col in quality_columns if col in df_feat.columns]
+        if existing_quality_cols:
+            df_feat['overall_quality_score'] = df_feat[existing_quality_cols].mean(axis=1)
+        
+        # 价格分段
+        if 'historical_price' in df_feat.columns:
+            df_feat['price_category'] = pd.cut(
+                df_feat['historical_price'],
+                bins=[0, 1000, 5000, 10000, float('inf')],
+                labels=['low', 'medium', 'high', 'premium']
+            )
+        
+        # 交易活跃度
+        if 'transaction_count' in df_feat.columns and 'view_count' in df_feat.columns:
+            df_feat['engagement_ratio'] = df_feat['transaction_count'] / (df_feat['view_count'] + 1)
+        
+        # 文本特征长度
+        if 'description' in df_feat.columns:
+            df_feat['description_length'] = df_feat['description'].str.len()
+        
+        return df_feat
+    
+    def label_business_scenarios(self, df: pd.DataFrame) -> pd.DataFrame:
+        """标注业务场景"""
+        df_labeled = df.copy()
+        
+        def detect_scenario(text):
+            """检测文本中的业务场景关键词"""
+            if not isinstance(text, str):
+                return 'other'
+            
+            text_lower = text.lower()
+            for scenario, keywords in self.business_scenarios.items():
+                if any(keyword in text_lower for keyword in keywords):
+                    return scenario
+            return 'other'
+        
+        # 使用描述和资产名称检测业务场景
+        if 'description' in df_labeled.columns and 'asset_name' in df_labeled.columns:
+            combined_text = df_labeled['description'].fillna('') + ' ' + df_labeled['asset_name'].fillna('')
+            df_labeled['business_scenario'] = combined_text.apply(detect_scenario)
+        
+        return df_labeled
+    
+    def normalize_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """数据标准化"""
+        df_norm = df.copy()
+        
+        # 数值列标准化
+        numeric_columns = df_norm.select_dtypes(include=[np.number]).columns.tolist()
+        
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        
+        df_norm[numeric_columns] = scaler.fit_transform(df_norm[numeric_columns])
+        
+        return df_norm
+
+# 使用示例
+if __name__ == "__main__":
+    preprocessor = YoueDataPreprocessor()
+    
+    # 加载数据
+    raw_df = preprocessor.load_raw_data("youe_data/youe_data_assets_20241215_143022.json")
+    
+    # 预处理
+    processed_df = preprocessor.preprocess_data(raw_df)
+    
+    # 保存处理后的数据
+    processed_df.to_csv("youe_data/processed_youe_data.csv", index=False)
+    processed_df.to_json("youe_data/processed_youe_data.json", orient='records', indent=2)
+    
+    print(f"预处理完成！共处理 {len(processed_df)} 条记录")
+    print(f"业务场景分布: {processed_df['business_scenario'].value_counts().to_dict()}")
+
+
+
+
+
+
