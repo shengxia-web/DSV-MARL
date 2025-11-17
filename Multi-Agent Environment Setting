@@ -1,0 +1,377 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import List, Dict, Tuple, Any
+import gym
+from gym import spaces
+from collections import deque
+import random
+
+class DataAssetAgent:
+    """单个数据资产智能体类"""
+    def __init__(self, agent_id: int, data_asset_id: str, action_dim: int):
+        self.agent_id = agent_id
+        self.data_asset_id = data_asset_id
+        self.action_dim = action_dim
+        
+    def get_observation(self, global_state):
+        """获取观察值 - 在完全合作设置中观察全局状态"""
+        return global_state
+
+class MultiAgentDataEnvironment:
+    """
+    多智能体数据资产环境
+    对应论文3.1节：Multi-Agent Environment Setting
+    """
+    
+    def __init__(self, 
+                 num_agents: int = 5,
+                 context_dim: int = 10,
+                 action_dim: int = 3,
+                 history_length: int = 10,
+                 max_steps: int = 100):
+        
+        self.num_agents = num_agents
+        self.context_dim = context_dim  # 上下文特征维度
+        self.action_dim = action_dim    # 每个智能体的动作维度
+        self.history_length = history_length
+        self.max_steps = max_steps
+        self.current_step = 0
+        self.done = False
+        
+        # 初始化智能体集合 N = {1,2,⋯,n}
+        self.agents = [DataAssetAgent(i, f"data_asset_{i}", action_dim) 
+                      for i in range(num_agents)]
+        
+        # 状态空间定义 S = (C_t, H_t)
+        self.state_space = spaces.Dict({
+            'context': spaces.Box(low=-1.0, high=1.0, shape=(context_dim,), dtype=np.float32),
+            'history': spaces.Box(low=-1.0, high=1.0, shape=(history_length, action_dim * num_agents), dtype=np.float32)
+        })
+        
+        # 动作空间 A = A¹ × A² × ⋯ × Aⁿ
+        self.action_space = spaces.Tuple([
+            spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32) 
+            for _ in range(num_agents)
+        ])
+        
+        # LSTM用于历史状态编码
+        self.lstm = nn.LSTM(
+            input_size=action_dim * num_agents,
+            hidden_size=64,
+            num_layers=1,
+            batch_first=True
+        )
+        
+        # 初始化状态
+        self.reset()
+    
+    def reset(self) -> Dict[str, torch.Tensor]:
+        """重置环境到初始状态"""
+        self.current_step = 0
+        self.done = False
+        
+        # 初始化上下文特征 C_0
+        self.context = torch.randn(self.context_dim)
+        
+        # 初始化历史状态 H_0 (使用LSTM隐藏状态)
+        self.history_buffer = deque(maxlen=self.history_length)
+        initial_actions = torch.zeros(self.action_dim * self.num_agents)
+        for _ in range(self.history_length):
+            self.history_buffer.append(initial_actions.clone())
+        
+        # LSTM初始隐藏状态
+        batch_size = 1
+        self.hidden_state = (
+            torch.zeros(1, batch_size, 64),  # h_0
+            torch.zeros(1, batch_size, 64)   # c_0
+        )
+        
+        # 构建初始状态 S_0 = (C_0, H_0)
+        current_state = self._get_current_state()
+        
+        return current_state
+    
+    def _get_current_state(self) -> Dict[str, torch.Tensor]:
+        """获取当前状态 S_t = (C_t, H_t)"""
+        # 历史动作序列
+        history_tensor = torch.stack(list(self.history_buffer))
+        
+        # 使用LSTM编码历史信息 H_t
+        history_input = history_tensor.unsqueeze(0)  # 添加batch维度
+        history_encoded, self.hidden_state = self.lstm(history_input, self.hidden_state)
+        H_t = history_encoded.squeeze(0)[-1]  # 取最后一个时间步的输出
+        
+        return {
+            'context': self.context.clone(),
+            'history': H_t.clone()
+        }
+    
+    def _update_history(self, joint_actions: torch.Tensor):
+        """更新历史缓冲区 H_{t+1} ← LSTM(H_t, a_t)"""
+        # 将联合动作展平并添加到历史缓冲区
+        flattened_actions = joint_actions.flatten()
+        self.history_buffer.append(flattened_actions)
+        
+        # 确保缓冲区长度一致
+        while len(self.history_buffer) < self.history_length:
+            self.history_buffer.append(torch.zeros_like(flattened_actions))
+    
+    def _state_transition(self, current_state: Dict, joint_actions: torch.Tensor) -> Dict:
+        """状态转移函数 P(S_{t+1} | S_t, a_t)"""
+        # 模拟环境动态 - 这里可以根据具体业务场景定制
+        # 例如：在推荐系统模拟用户行为，在风控系统模拟贷款审批流程
+        
+        # 更新上下文特征 (模拟环境变化)
+        context_change = 0.1 * torch.randn_like(self.context)
+        self.context = self.context + context_change
+        
+        # 更新历史状态
+        self._update_history(joint_actions)
+        
+        # 返回新状态
+        return self._get_current_state()
+    
+    def _check_termination(self, state: Dict) -> bool:
+        """检查终止条件"""
+        # 达到最大步数或满足业务终止条件
+        if self.current_step >= self.max_steps:
+            return True
+        
+        # 这里可以添加其他业务特定的终止条件
+        # 例如：在金融风控中，贷款审批完成；在推荐系统中，用户会话结束
+        
+        return False
+    
+    def _calculate_global_reward(self, state: Dict, joint_actions: torch.Tensor) -> float:
+        """
+        计算全局奖励函数 R
+        在episode结束时调用，代表最终业务成果的价值
+        """
+        if not self.done:
+            return 0.0
+        
+        # 模拟不同业务场景的奖励计算
+        business_scenario = self._get_current_business_scenario()
+        
+        if business_scenario == "financial_risk_control":
+            # 金融风控场景：R = 2 × Accuracy - 1
+            accuracy = self._simulate_risk_control_accuracy(joint_actions)
+            reward = 2.0 * accuracy - 1.0
+            
+        elif business_scenario == "ecommerce_recommendation":
+            # 电商推荐场景：R = ConversionRate × 10
+            conversion_rate = self._simulate_conversion_rate(joint_actions)
+            reward = conversion_rate * 10.0
+            
+        elif business_scenario == "medical_diagnosis":
+            # 医疗诊断场景：R = F1-Score × 5
+            f1_score = self._simulate_diagnosis_f1(joint_actions)
+            reward = f1_score * 5.0
+            
+        else:
+            # 默认奖励函数
+            reward = self._default_reward_function(joint_actions)
+        
+        return float(reward)
+    
+    def _get_current_business_scenario(self) -> str:
+        """获取当前业务场景"""
+        # 基于上下文特征确定业务场景
+        scenarios = ["financial_risk_control", "ecommerce_recommendation", "medical_diagnosis"]
+        scenario_idx = torch.argmax(self.context[:3]).item() % len(scenarios)
+        return scenarios[scenario_idx]
+    
+    def _simulate_risk_control_accuracy(self, joint_actions: torch.Tensor) -> float:
+        """模拟金融风控准确率"""
+        # 简化的准确率计算 - 实际应用中应该基于真实的业务逻辑
+        action_quality = torch.mean(torch.sigmoid(joint_actions)).item()
+        return 0.7 + 0.3 * action_quality  # 基础准确率 + 动作质量贡献
+    
+    def _simulate_conversion_rate(self, joint_actions: torch.Tensor) -> float:
+        """模拟电商转化率"""
+        # 基于动作协调性计算转化率
+        action_std = torch.std(joint_actions).item()
+        coordination = 1.0 / (1.0 + action_std)  # 动作标准差越小，协调性越好
+        return 0.1 + 0.2 * coordination
+    
+    def _simulate_diagnosis_f1(self, joint_actions: torch.Tensor) -> float:
+        """模拟医疗诊断F1分数"""
+        # 基于动作的一致性和强度计算F1分数
+        action_mean = torch.mean(torch.abs(joint_actions)).item()
+        action_consistency = 1.0 - torch.std(joint_actions).item()
+        return 0.6 + 0.3 * action_mean * action_consistency
+    
+    def _default_reward_function(self, joint_actions: torch.Tensor) -> float:
+        """默认奖励函数"""
+        # 基于动作的协调性和强度计算奖励
+        action_coordination = 1.0 / (1.0 + torch.std(joint_actions).item())
+        action_strength = torch.mean(torch.abs(joint_actions)).item()
+        return action_coordination * action_strength
+    
+    def step(self, actions: List[torch.Tensor]) -> Tuple[Dict, float, bool, Dict]:
+        """
+        环境步进函数
+        输入: 所有智能体的动作列表
+        输出: (新状态, 奖励, 终止标志, 额外信息)
+        """
+        # 转换动作为张量
+        joint_actions = torch.stack(actions)  # shape: (num_agents, action_dim)
+        
+        # 获取当前状态
+        current_state = self._get_current_state()
+        
+        # 状态转移: S_{t+1} ← P(S_t, a_t)
+        next_state = self._state_transition(current_state, joint_actions)
+        
+        # 检查终止条件
+        self.done = self._check_termination(next_state)
+        
+        # 计算全局奖励 (通常在episode结束时给出)
+        reward = self._calculate_global_reward(next_state, joint_actions)
+        
+        # 更新步数
+        self.current_step += 1
+        
+        # 额外信息
+        info = {
+            'step': self.current_step,
+            'business_scenario': self._get_current_business_scenario(),
+            'joint_actions': joint_actions.detach()
+        }
+        
+        return next_state, reward, self.done, info
+    
+    def get_observations(self, state: Dict) -> List[Dict]:
+        """获取每个智能体的观察值"""
+        # 在完全合作和信息共享设置中，每个智能体观察全局状态
+        observations = []
+        for agent in self.agents:
+            obs = {
+                'global_state': state,
+                'agent_id': agent.agent_id,
+                'data_asset_id': agent.data_asset_id
+            }
+            observations.append(obs)
+        return observations
+
+# 环境模拟过程伪代码的实现
+class MultiAgentEnvironmentSimulator:
+    """
+    算法1: 多智能体环境模拟过程
+    对应论文图2的伪代码实现
+    """
+    
+    def __init__(self, env_config: Dict):
+        self.env = MultiAgentDataEnvironment(**env_config)
+        self.num_agents = env_config.get('num_agents', 5)
+        self.max_episodes = env_config.get('max_episodes', 1000)
+        self.max_steps = env_config.get('max_steps', 100)
+        self.gamma = env_config.get('gamma', 0.99)
+        
+        # 经验回放缓冲区
+        self.replay_buffer = deque(maxlen=100000)
+        
+    def simulate_episode(self, policy_networks: List[nn.Module]) -> Dict:
+        """
+        模拟一个完整的episode
+        输入: 各智能体的策略网络
+        输出: episode统计信息
+        """
+        # 初始化环境
+        state = self.env.reset()
+        episode_experience = []
+        total_reward = 0.0
+        step_count = 0
+        
+        while step_count < self.env.max_steps and not self.env.done:
+            # 所有智能体选择动作
+            actions = []
+            for i, policy_net in enumerate(policy_networks):
+                # 获取智能体观察值
+                observations = self.env.get_observations(state)
+                agent_obs = observations[i]
+                
+                # 策略网络选择动作 a_t^i ← π_i(S_t)
+                with torch.no_grad():
+                    action = policy_net(agent_obs)
+                actions.append(action)
+            
+            # 环境更新
+            next_state, reward, done, info = self.env.step(actions)
+            
+            # 存储经验
+            experience = {
+                'state': state,
+                'actions': actions,
+                'reward': reward,
+                'next_state': next_state,
+                'done': done,
+                'info': info
+            }
+            episode_experience.append(experience)
+            
+            # 存储到回放缓冲区
+            self.replay_buffer.append(experience)
+            
+            # 更新状态
+            state = next_state
+            total_reward += reward
+            step_count += 1
+        
+        # 计算折扣回报
+        discounted_return = self._calculate_discounted_return(episode_experience)
+        
+        return {
+            'total_reward': total_reward,
+            'steps': step_count,
+            'discounted_return': discounted_return,
+            'experience': episode_experience
+        }
+    
+    def _calculate_discounted_return(self, episode_experience: List[Dict]) -> float:
+        """计算折扣回报"""
+        returns = 0.0
+        for i, exp in enumerate(reversed(episode_experience)):
+            returns = exp['reward'] + self.gamma * returns
+        return returns
+
+# 示例使用代码
+if __name__ == "__main__":
+    # 环境配置
+    env_config = {
+        'num_agents': 5,
+        'context_dim': 10,
+        'action_dim': 3,
+        'history_length': 10,
+        'max_steps': 100
+    }
+    
+    # 创建环境和模拟器
+    env = MultiAgentDataEnvironment(**env_config)
+    simulator = MultiAgentEnvironmentSimulator(env_config)
+    
+    # 测试环境重置
+    state = env.reset()
+    print("初始状态:", state.keys())
+    print("上下文特征维度:", state['context'].shape)
+    print("历史编码维度:", state['history'].shape)
+    
+    # 测试单步执行
+    random_actions = [torch.randn(env_config['action_dim']) for _ in range(env_config['num_agents'])]
+    next_state, reward, done, info = env.step(random_actions)
+    
+    print("\n单步执行结果:")
+    print("奖励:", reward)
+    print("是否终止:", done)
+    print("额外信息:", info.keys())
+
+
+
+
+
+
+
+
+
+
