@@ -1,0 +1,555 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Dict, Tuple, Optional, List
+import torch.distributions as distributions
+
+class SharedStateEncoder(nn.Module):
+    """
+    共享状态编码网络 f_enc
+    所有智能体共享，用于提取环境的共同特征表示
+    """
+    def __init__(self, state_dim: int, hidden_dims: List[int] = [128, 64, 32], output_dim: int = 128):
+        super(SharedStateEncoder, self).__init__()
+        
+        # 构建多层感知机
+        layers = []
+        input_dim = state_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            ])
+            input_dim = hidden_dim
+        
+        # 输出层
+        layers.append(nn.Linear(input_dim, output_dim))
+        
+        self.network = nn.Sequential(*layers)
+        
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        输入: 原始状态 S_t = (C_t, H_t) 的拼接
+        输出: 编码后的状态表示 s_t
+        """
+        return self.network(state)
+
+class DataFeatureExtractor(nn.Module):
+    """
+    数据特征提取网络 g_i
+    每个智能体独有，用于融合环境信息和数据资产特征
+    """
+    def __init__(self, state_encoded_dim: int, data_embedding_dim: int, 
+                 hidden_dims: List[int] = [64, 32], output_dim: int = 64):
+        super(DataFeatureExtractor, self).__init__()
+        
+        # 输入是编码状态和数据资产嵌入的拼接
+        input_dim = state_encoded_dim + data_embedding_dim
+        
+        layers = []
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            ])
+            input_dim = hidden_dim
+        
+        # 输出层
+        layers.append(nn.Linear(input_dim, output_dim))
+        
+        self.network = nn.Sequential(*layers)
+        
+    def forward(self, encoded_state: torch.Tensor, data_embedding: torch.Tensor) -> torch.Tensor:
+        """
+        输入: 编码状态 s_t 和数据资产嵌入 d_i
+        输出: 数据特定的上下文向量 c_t^i
+        """
+        # 拼接状态编码和数据嵌入
+        combined = torch.cat([encoded_state, data_embedding], dim=-1)
+        return self.network(combined)
+
+class ContinuousPolicyHead(nn.Module):
+    """
+    连续动作空间的策略头 h_i_policy
+    输出高斯分布的参数 (均值, 对数标准差)
+    """
+    def __init__(self, input_dim: int, action_dim: int, hidden_dims: List[int] = [32, 16]):
+        super(ContinuousPolicyHead, self).__init__()
+        self.action_dim = action_dim
+        
+        # 构建网络
+        layers = []
+        current_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(current_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            ])
+            current_dim = hidden_dim
+        
+        # 输出均值和标准差的对数
+        self.feature_extractor = nn.Sequential(*layers)
+        self.mean_layer = nn.Linear(current_dim, action_dim)
+        self.log_std_layer = nn.Linear(current_dim, action_dim)
+        
+        # 初始化参数
+        self._initialize_weights()
+        
+    def _initialize_weights(self):
+        """初始化网络权重"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=0.01)
+                nn.init.constant_(module.bias, 0.0)
+                
+    def forward(self, context_vector: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        输入: 数据特定的上下文向量 c_t^i
+        输出: 高斯分布的均值和对数标准差
+        """
+        features = self.feature_extractor(context_vector)
+        mean = self.mean_layer(features)
+        log_std = self.log_std_layer(features)
+        
+        # 限制标准差的范围，确保稳定性
+        log_std = torch.clamp(log_std, min=-20, max=2)
+        
+        return mean, log_std
+
+class DiscretePolicyHead(nn.Module):
+    """
+    离散动作空间的策略头
+    输出每个动作的概率分布
+    """
+    def __init__(self, input_dim: int, num_actions: int, hidden_dims: List[int] = [32, 16]):
+        super(DiscretePolicyHead, self).__init__()
+        self.num_actions = num_actions
+        
+        # 构建网络
+        layers = []
+        current_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(current_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            ])
+            current_dim = hidden_dim
+        
+        layers.append(nn.Linear(current_dim, num_actions))
+        self.network = nn.Sequential(*layers)
+        
+    def forward(self, context_vector: torch.Tensor) -> torch.Tensor:
+        """
+        输入: 数据特定的上下文向量 c_t^i
+        输出: 动作的logits
+        """
+        return self.network(context_vector)
+
+class ValueNetwork(nn.Module):
+    """
+    价值网络 (Critic) V_i
+    用于估计智能体的期望长期回报
+    """
+    def __init__(self, state_encoded_dim: int, hidden_dims: List[int] = [64, 32], output_dim: int = 1):
+        super(ValueNetwork, self).__init__()
+        
+        layers = []
+        input_dim = state_encoded_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            ])
+            input_dim = hidden_dim
+        
+        # 输出单个标量值
+        layers.append(nn.Linear(input_dim, output_dim))
+        self.network = nn.Sequential(*layers)
+        
+    def forward(self, encoded_state: torch.Tensor) -> torch.Tensor:
+        """
+        输入: 编码状态 s_t
+        输出: 状态价值估计 V_i(S_t)
+        """
+        return self.network(encoded_state)
+
+class DataAssetPolicyNetwork(nn.Module):
+    """
+    完整的数据资产策略网络
+    对应论文3.2节描述的完整架构
+    """
+    def __init__(self, 
+                 state_dim: int,
+                 data_embedding_dim: int,
+                 action_dim: int,
+                 action_space_type: str = "continuous",  # "continuous" or "discrete"
+                 num_discrete_actions: Optional[int] = None,
+                 shared_encoder: Optional[nn.Module] = None,
+                 hidden_dims: Dict[str, List[int]] = None):
+        """
+        参数:
+            state_dim: 状态维度 (C_t + H_t 的拼接维度)
+            data_embedding_dim: 数据资产嵌入维度
+            action_dim: 动作维度 (连续动作空间) 或 动作数量 (离散动作空间)
+            action_space_type: 动作空间类型
+            num_discrete_actions: 离散动作数量 (仅离散动作空间需要)
+            shared_encoder: 共享状态编码器 (如果为None则创建新的)
+            hidden_dims: 各网络隐藏层维度配置
+        """
+        super(DataAssetPolicyNetwork, self).__init__()
+        
+        # 设置默认隐藏层维度
+        if hidden_dims is None:
+            hidden_dims = {
+                'encoder': [128, 64],
+                'feature_extractor': [64, 32],
+                'policy_head': [32, 16],
+                'value_net': [64, 32]
+            }
+        
+        self.state_dim = state_dim
+        self.data_embedding_dim = data_embedding_dim
+        self.action_dim = action_dim
+        self.action_space_type = action_space_type
+        
+        # 1. 共享状态编码器 (所有智能体共享)
+        if shared_encoder is None:
+            self.state_encoder = SharedStateEncoder(
+                state_dim=state_dim,
+                hidden_dims=hidden_dims['encoder'],
+                output_dim=128
+            )
+        else:
+            self.state_encoder = shared_encoder
+            
+        # 2. 数据特征提取网络 (每个智能体独有)
+        self.data_feature_extractor = DataFeatureExtractor(
+            state_encoded_dim=128,
+            data_embedding_dim=data_embedding_dim,
+            hidden_dims=hidden_dims['feature_extractor'],
+            output_dim=64
+        )
+        
+        # 3. 策略头 (每个智能体独有)
+        if action_space_type == "continuous":
+            self.policy_head = ContinuousPolicyHead(
+                input_dim=64,
+                action_dim=action_dim,
+                hidden_dims=hidden_dims['policy_head']
+            )
+        else:
+            if num_discrete_actions is None:
+                raise ValueError("num_discrete_actions must be specified for discrete action space")
+            self.policy_head = DiscretePolicyHead(
+                input_dim=64,
+                num_actions=num_discrete_actions,
+                hidden_dims=hidden_dims['policy_head']
+            )
+        
+        # 4. 价值网络 (每个智能体独有)
+        self.value_network = ValueNetwork(
+            state_encoded_dim=128,
+            hidden_dims=hidden_dims['value_net'],
+            output_dim=1
+        )
+        
+        # 数据资产嵌入向量 (可学习参数)
+        self.data_embedding = nn.Parameter(torch.randn(data_embedding_dim))
+        
+        # 训练模式标志
+        self.training_mode = True
+        
+    def set_training_mode(self, training: bool):
+        """设置训练/评估模式"""
+        self.training_mode = training
+        
+    def forward(self, state: torch.Tensor) -> Tuple[distributions.Distribution, torch.Tensor]:
+        """
+        前向传播 - 对应表1的执行过程
+        
+        输入: 全局状态 S_t = (C_t, H_t)
+        输出: 动作分布 π_i(·|S_t) 和 状态价值 V_i(S_t)
+        """
+        # Step 1: 状态编码 - 提取环境特征
+        encoded_state = self.state_encoder(state)  # s_t = f_enc(S_t; θ_enc)
+        
+        # Step 2: 数据特征提取 - 个性化上下文融合
+        context_vector = self.data_feature_extractor(encoded_state, self.data_embedding)  # c_t^i = g_i(s_t, d_i; θ_i^g)
+        
+        # Step 3: 策略头输出 - 生成动作分布参数
+        if self.action_space_type == "continuous":
+            mean, log_std = self.policy_head(context_vector)
+            std = torch.exp(log_std)
+            action_distribution = distributions.Normal(mean, std)
+        else:
+            logits = self.policy_head(context_vector)
+            action_distribution = distributions.Categorical(logits=logits)
+        
+        # 价值网络输出
+        state_value = self.value_network(encoded_state)  # V_i(S_t) = f_critic(s_t; φ_i)
+        
+        return action_distribution, state_value.squeeze(-1)
+    
+    def get_action(self, state: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        根据状态选择动作
+        
+        参数:
+            state: 输入状态
+            deterministic: 是否选择确定性动作 (评估时使用)
+            
+        返回: (动作, 动作的对数概率, 状态价值)
+        """
+        action_distribution, state_value = self.forward(state)
+        
+        if deterministic:
+            # 评估模式: 选择均值(连续)或最大概率动作(离散)
+            if self.action_space_type == "continuous":
+                action = action_distribution.mean
+            else:
+                action = torch.argmax(action_distribution.probs, dim=-1)
+            log_prob = action_distribution.log_prob(action)
+        else:
+            # 训练模式: 从分布中采样
+            if self.training_mode:
+                action = action_distribution.rsample()  # 使用重参数化技巧
+            else:
+                action = action_distribution.sample()
+            log_prob = action_distribution.log_prob(action)
+        
+        return action, log_prob, state_value
+    
+    def evaluate_actions(self, state: torch.Tensor, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        评估给定动作的对数概率和熵
+        
+        返回: (动作的对数概率, 熵, 状态价值)
+        """
+        action_distribution, state_value = self.forward(state)
+        
+        log_prob = action_distribution.log_prob(actions)
+        entropy = action_distribution.entropy()
+        
+        return log_prob, entropy, state_value
+
+class MultiAgentPolicyManager:
+    """
+    多智能体策略管理器
+    管理所有数据资产智能体的策略网络
+    """
+    def __init__(self, 
+                 num_agents: int,
+                 state_dim: int,
+                 data_embedding_dim: int,
+                 action_dim: int,
+                 action_space_type: str = "continuous",
+                 device: torch.device = torch.device("cpu")):
+        
+        self.num_agents = num_agents
+        self.state_dim = state_dim
+        self.device = device
+        
+        # 创建共享状态编码器
+        shared_encoder = SharedStateEncoder(state_dim=state_dim)
+        
+        # 为每个智能体创建策略网络
+        self.policy_networks = nn.ModuleList([
+            DataAssetPolicyNetwork(
+                state_dim=state_dim,
+                data_embedding_dim=data_embedding_dim,
+                action_dim=action_dim,
+                action_space_type=action_space_type,
+                shared_encoder=shared_encoder  # 共享编码器
+            ) for _ in range(num_agents)
+        ])
+        
+        # 移动到设备
+        self.to(device)
+        
+    def to(self, device: torch.device):
+        """移动所有网络到指定设备"""
+        self.device = device
+        self.policy_networks.to(device)
+        
+    def set_training_mode(self, training: bool):
+        """设置所有网络的训练模式"""
+        for network in self.policy_networks:
+            network.set_training_mode(training)
+            
+    def get_actions(self, states: torch.Tensor, deterministic: bool = False) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """
+        为所有智能体获取动作
+        
+        返回: (动作列表, 对数概率列表, 状态价值列表)
+        """
+        actions, log_probs, values = [], [], []
+        
+        for i, policy_net in enumerate(self.policy_networks):
+            action, log_prob, value = policy_net.get_action(states, deterministic)
+            actions.append(action)
+            log_probs.append(log_prob)
+            values.append(value)
+            
+        return actions, log_probs, values
+    
+    def evaluate_actions(self, states: torch.Tensor, actions: List[torch.Tensor]) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """
+        评估所有智能体的动作
+        
+        返回: (对数概率列表, 熵列表, 状态价值列表)
+        """
+        log_probs, entropies, values = [], [], []
+        
+        for i, (policy_net, action) in enumerate(zip(self.policy_networks, actions)):
+            log_prob, entropy, value = policy_net.evaluate_actions(states, action)
+            log_probs.append(log_prob)
+            entropies.append(entropy)
+            values.append(value)
+            
+        return log_probs, entropies, values
+
+# 表1: 动作执行过程的代码实现
+class ActionExecutionProcess:
+    """
+    实现论文中表1描述的动作执行过程
+    """
+    
+    @staticmethod
+    def execute_step(policy_network: DataAssetPolicyNetwork, 
+                    state: torch.Tensor,
+                    training: bool = True) -> Dict[str, torch.Tensor]:
+        """
+        执行表1中的动作执行过程
+        
+        参数:
+            policy_network: 策略网络
+            state: 全局状态 S_t = (C_t, H_t)
+            training: 是否为训练模式
+            
+        返回: 包含所有输出信息的字典
+        """
+        result = {}
+        
+        # Step 1: 状态编码
+        with torch.no_grad():
+            encoded_state = policy_network.state_encoder(state)
+        result['encoded_state'] = encoded_state
+        
+        # Step 2: 数据特征提取
+        context_vector = policy_network.data_feature_extractor(
+            encoded_state, policy_network.data_embedding)
+        result['context_vector'] = context_vector
+        
+        # Step 3: 策略头输出
+        if policy_network.action_space_type == "continuous":
+            mean, log_std = policy_network.policy_head(context_vector)
+            std = torch.exp(log_std)
+            action_distribution = distributions.Normal(mean, std)
+            result['distribution_params'] = {'mean': mean, 'std': std}
+        else:
+            logits = policy_network.policy_head(context_vector)
+            action_distribution = distributions.Categorical(logits=logits)
+            result['distribution_params'] = {'logits': logits}
+        
+        # Step 4: 动作采样
+        if training:
+            # 训练时采样
+            action = action_distribution.sample()
+        else:
+            # 评估时选择确定性动作
+            if policy_network.action_space_type == "continuous":
+                action = action_distribution.mean
+            else:
+                action = torch.argmax(action_distribution.probs, dim=-1)
+        
+        result['action'] = action
+        result['action_distribution'] = action_distribution
+        
+        # Step 5: 价值估计
+        state_value = policy_network.value_network(encoded_state)
+        result['state_value'] = state_value.squeeze(-1)
+        
+        return result
+
+# 示例使用和测试代码
+if __name__ == "__main__":
+    # 设置参数
+    state_dim = 50  # C_t (10) + H_t (40) 的拼接维度
+    data_embedding_dim = 20
+    action_dim = 3
+    num_agents = 5
+    batch_size = 32
+    
+    # 创建多智能体策略管理器
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    policy_manager = MultiAgentPolicyManager(
+        num_agents=num_agents,
+        state_dim=state_dim,
+        data_embedding_dim=data_embedding_dim,
+        action_dim=action_dim,
+        action_space_type="continuous",
+        device=device
+    )
+    
+    # 测试数据
+    states = torch.randn(batch_size, state_dim).to(device)
+    
+    print("=== 测试连续动作空间 ===")
+    
+    # 训练模式 - 采样动作
+    policy_manager.set_training_mode(True)
+    actions, log_probs, values = policy_manager.get_actions(states, deterministic=False)
+    
+    print(f"状态张量形状: {states.shape}")
+    print(f"智能体数量: {len(actions)}")
+    print(f"每个智能体动作形状: {actions[0].shape}")
+    print(f"每个智能体对数概率形状: {log_probs[0].shape}")
+    print(f"每个智能体状态价值形状: {values[0].shape}")
+    
+    # 评估模式 - 确定性动作
+    policy_manager.set_training_mode(False)
+    deterministic_actions, _, _ = policy_manager.get_actions(states, deterministic=True)
+    
+    print(f"\n训练模式动作范围: [{actions[0].min():.3f}, {actions[0].max():.3f}]")
+    print(f"评估模式动作范围: [{determinative_actions[0].min():.3f}, {determinative_actions[0].max():.3f}]")
+    
+    # 测试动作评估
+    print("\n=== 测试动作评估 ===")
+    log_probs_eval, entropies, values_eval = policy_manager.evaluate_actions(states, actions)
+    print(f"动作评估 - 对数概率形状: {log_probs_eval[0].shape}")
+    print(f"动作评估 - 熵形状: {entropies[0].shape}")
+    print(f"动作评估 - 状态价值形状: {values_eval[0].shape}")
+    
+    # 测试表1的执行过程
+    print("\n=== 测试表1动作执行过程 ===")
+    single_policy = policy_manager.policy_networks[0]
+    single_state = states[0]  # 单个状态
+    
+    execution_result = ActionExecutionProcess.execute_step(
+        single_policy, single_state.unsqueeze(0), training=True
+    )
+    
+    for key, value in execution_result.items():
+        if isinstance(value, torch.Tensor):
+            print(f"{key}: {value.shape}")
+        else:
+            print(f"{key}: {type(value)}")
+    
+    # 参数统计
+    total_params = sum(p.numel() for p in policy_manager.parameters())
+    trainable_params = sum(p.numel() for p in policy_manager.parameters() if p.requires_grad)
+    
+    print(f"\n=== 网络参数统计 ===")
+    print(f"总参数数量: {total_params:,}")
+    print(f"可训练参数数量: {trainable_params:,}")
+    print(f"每个智能体平均参数数量: {trainable_params // num_agents:,}")
