@@ -1,0 +1,362 @@
+import requests
+import pandas as pd
+import json
+import time
+import random
+from bs4 import BeautifulSoup
+import os
+from datetime import datetime
+import logging
+from typing import List, Dict, Optional
+
+class YoueDataCrawler:
+    """
+    Youe Data Asset Network 数据爬取器
+    用于获取数据资产交易区块数据
+    """
+    
+    def __init__(self, base_url: str = "https://www.youedata.com"):
+        self.base_url = base_url
+        self.session = requests.Session()
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+        }
+        
+        # 配置日志
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('youe_data_crawler.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+        
+    def get_data_service_page(self, page: int = 1, page_size: int = 50) -> Optional[Dict]:
+        """
+        获取数据服务页面数据
+        
+        参数:
+            page: 页码
+            page_size: 每页大小
+            
+        返回:
+            JSON响应数据
+        """
+        url = f"{self.base_url}/api/data-service"
+        params = {
+            'page': page,
+            'pageSize': page_size,
+            'sortField': 'createTime',
+            'sortOrder': 'desc'
+        }
+        
+        try:
+            response = self.session.get(url, params=params, headers=self.headers, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            self.logger.info(f"成功获取第 {page} 页数据，共 {len(data.get('data', []))} 条记录")
+            return data
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"获取第 {page} 页数据失败: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            self.logger.error(f"解析第 {page} 页JSON数据失败: {e}")
+            return None
+    
+    def parse_data_asset_info(self, raw_data: Dict) -> Dict:
+        """
+        解析单个数据资产信息
+        
+        参数:
+            raw_data: 原始数据
+            
+        返回:
+            结构化数据资产信息
+        """
+        asset_info = {}
+        
+        try:
+            # 基础字段
+            asset_info['asset_id'] = raw_data.get('id')
+            asset_info['asset_name'] = raw_data.get('name')
+            asset_info['description'] = raw_data.get('description')
+            asset_info['data_type'] = raw_data.get('dataType')
+            asset_info['provider'] = raw_data.get('provider')
+            asset_info['create_time'] = raw_data.get('createTime')
+            asset_info['update_time'] = raw_data.get('updateTime')
+            
+            # 交易信息
+            asset_info['historical_price'] = raw_data.get('price')
+            asset_info['transaction_count'] = raw_data.get('transactionCount')
+            asset_info['view_count'] = raw_data.get('viewCount')
+            
+            # 数据质量评分
+            quality_scores = raw_data.get('qualityScores', {})
+            asset_info['completeness_score'] = quality_scores.get('completeness')
+            asset_info['accuracy_score'] = quality_scores.get('accuracy')
+            asset_info['timeliness_score'] = quality_scores.get('timeliness')
+            asset_info['consistency_score'] = quality_scores.get('consistency')
+            asset_info['availability_score'] = quality_scores.get('availability')
+            asset_info['scarcity_score'] = quality_scores.get('scarcity')
+            asset_info['compliance_score'] = quality_scores.get('compliance')
+            
+            # 应用场景和特征
+            asset_info['application_scenarios'] = raw_data.get('applicationScenarios', [])
+            asset_info['data_features'] = raw_data.get('dataFeatures', [])
+            
+            # 元数据
+            asset_info['data_volume'] = raw_data.get('dataVolume')
+            asset_info['update_frequency'] = raw_data.get('updateFrequency')
+            asset_info['coverage_period'] = raw_data.get('coveragePeriod')
+            
+            self.logger.debug(f"成功解析资产 {asset_info['asset_id']} 信息")
+            
+        except Exception as e:
+            self.logger.error(f"解析数据资产信息失败: {e}")
+            
+        return asset_info
+    
+    def crawl_all_data_assets(self, max_pages: int = 100, delay: float = 1.0) -> List[Dict]:
+        """
+        爬取所有数据资产信息
+        
+        参数:
+            max_pages: 最大爬取页数
+            delay: 请求延迟（秒）
+            
+        返回:
+            数据资产列表
+        """
+        all_assets = []
+        page = 1
+        
+        while page <= max_pages:
+            self.logger.info(f"正在爬取第 {page} 页...")
+            
+            # 获取页面数据
+            page_data = self.get_data_service_page(page)
+            if not page_data:
+                break
+                
+            # 提取数据列表
+            data_list = page_data.get('data', [])
+            if not data_list:
+                self.logger.info("没有更多数据")
+                break
+            
+            # 解析每条数据资产
+            for raw_asset in data_list:
+                asset_info = self.parse_data_asset_info(raw_asset)
+                if asset_info:
+                    all_assets.append(asset_info)
+            
+            self.logger.info(f"第 {page} 页完成，累计获取 {len(all_assets)} 条记录")
+            
+            # 检查是否有更多页面
+            if len(data_list) < 50:  # 假设每页最多50条
+                break
+                
+            page += 1
+            time.sleep(delay + random.uniform(0.5, 1.5))  # 随机延迟
+            
+        return all_assets
+    
+    def save_to_files(self, data_assets: List[Dict], output_dir: str = "youe_data"):
+        """
+        将数据保存到文件
+        
+        参数:
+            data_assets: 数据资产列表
+            output_dir: 输出目录
+        """
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 保存为JSON
+        json_filename = os.path.join(output_dir, f"youe_data_assets_{timestamp}.json")
+        with open(json_filename, 'w', encoding='utf-8') as f:
+            json.dump(data_assets, f, ensure_ascii=False, indent=2)
+        
+        # 保存为CSV
+        if data_assets:
+            df = pd.DataFrame(data_assets)
+            csv_filename = os.path.join(output_dir, f"youe_data_assets_{timestamp}.csv")
+            df.to_csv(csv_filename, index=False, encoding='utf-8-sig')
+        
+        # 保存统计信息
+        stats = self.calculate_statistics(data_assets)
+        stats_filename = os.path.join(output_dir, f"crawling_stats_{timestamp}.json")
+        with open(stats_filename, 'w', encoding='utf-8') as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+        
+        self.logger.info(f"数据已保存到 {output_dir} 目录")
+        self.logger.info(f"JSON文件: {json_filename}")
+        self.logger.info(f"CSV文件: {csv_filename}")
+        self.logger.info(f"统计文件: {stats_filename}")
+    
+    def calculate_statistics(self, data_assets: List[Dict]) -> Dict:
+        """
+        计算数据集的统计信息
+        
+        参数:
+            data_assets: 数据资产列表
+            
+        返回:
+            统计信息字典
+        """
+        if not data_assets:
+            return {}
+        
+        stats = {
+            'total_records': len(data_assets),
+            'crawling_time': datetime.now().isoformat(),
+            'data_types': {},
+            'providers': {},
+            'price_statistics': {},
+            'quality_score_statistics': {}
+        }
+        
+        # 数据类型统计
+        data_types = [asset.get('data_type', 'Unknown') for asset in data_assets]
+        stats['data_types'] = {dt: data_types.count(dt) for dt in set(data_types)}
+        
+        # 提供商统计
+        providers = [asset.get('provider', 'Unknown') for asset in data_assets]
+        stats['providers'] = {p: providers.count(p) for p in set(providers)}
+        
+        # 价格统计
+        prices = [asset.get('historical_price', 0) for asset in data_assets if asset.get('historical_price')]
+        if prices:
+            stats['price_statistics'] = {
+                'min': min(prices),
+                'max': max(prices),
+                'mean': sum(prices) / len(prices),
+                'count': len(prices)
+            }
+        
+        # 质量评分统计
+        quality_fields = ['completeness_score', 'accuracy_score', 'timeliness_score', 
+                         'consistency_score', 'availability_score', 'scarcity_score', 'compliance_score']
+        
+        for field in quality_fields:
+            scores = [asset.get(field, 0) for asset in data_assets if asset.get(field) is not None]
+            if scores:
+                stats['quality_score_statistics'][field] = {
+                    'min': min(scores),
+                    'max': max(scores),
+                    'mean': sum(scores) / len(scores),
+                    'count': len(scores)
+                }
+        
+        return stats
+
+def validate_data_assets(data_assets: List[Dict]) -> Dict:
+    """
+    验证数据资产的质量和完整性
+    
+    参数:
+        data_assets: 数据资产列表
+        
+    返回:
+        验证结果
+    """
+    validation_result = {
+        'total_assets': len(data_assets),
+        'valid_assets': 0,
+        'missing_fields': {},
+        'data_quality_issues': []
+    }
+    
+    required_fields = ['asset_id', 'asset_name', 'data_type', 'provider']
+    quality_fields = ['completeness_score', 'accuracy_score', 'timeliness_score']
+    
+    for asset in data_assets:
+        # 检查必需字段
+        missing_required = [field for field in required_fields if not asset.get(field)]
+        if not missing_required:
+            validation_result['valid_assets'] += 1
+        
+        # 记录缺失字段
+        for field in missing_required:
+            if field not in validation_result['missing_fields']:
+                validation_result['missing_fields'][field] = 0
+            validation_result['missing_fields'][field] += 1
+        
+        # 检查数据质量问题
+        quality_scores = [asset.get(field, 0) for field in quality_fields if asset.get(field) is not None]
+        if quality_scores and min(quality_scores) < 0.6:
+            validation_result['data_quality_issues'].append({
+                'asset_id': asset.get('asset_id'),
+                'low_scores': [field for field in quality_fields if asset.get(field, 1) < 0.6]
+            })
+    
+    return validation_result
+
+def main():
+    """
+    主函数 - 执行数据爬取流程
+    """
+    print("=== Youe Data Asset Network 数据爬取程序 ===")
+    print("注意: 请确保遵守网站的使用条款和robots.txt")
+    print()
+    
+    # 初始化爬虫
+    crawler = YoueDataCrawler()
+    
+    try:
+        # 爬取数据
+        print("开始爬取数据资产信息...")
+        data_assets = crawler.crawl_all_data_assets(max_pages=80, delay=1.5)
+        
+        if not data_assets:
+            print("未获取到任何数据，程序结束")
+            return
+        
+        print(f"\n成功爬取 {len(data_assets)} 条数据资产记录")
+        
+        # 验证数据
+        print("\n正在进行数据验证...")
+        validation_result = validate_data_assets(data_assets)
+        print(f"有效资产: {validation_result['valid_assets']}/{validation_result['total_assets']}")
+        
+        if validation_result['missing_fields']:
+            print("缺失字段统计:")
+            for field, count in validation_result['missing_fields'].items():
+                print(f"  {field}: {count}")
+        
+        # 保存数据
+        print("\n保存数据到文件...")
+        crawler.save_to_files(data_assets)
+        
+        # 显示基本统计
+        stats = crawler.calculate_statistics(data_assets)
+        print(f"\n=== 数据统计摘要 ===")
+        print(f"总记录数: {stats['total_records']}")
+        print(f"数据类型分布: {stats['data_types']}")
+        print(f"提供商数量: {len(stats['providers'])}")
+        
+        if stats['price_statistics']:
+            price_stats = stats['price_statistics']
+            print(f"价格范围: {price_stats['min']} - {price_stats['max']}")
+            print(f"平均价格: {price_stats['mean']:.2f}")
+        
+        print(f"\n爬取完成！数据已保存到 youe_data 目录")
+        
+    except KeyboardInterrupt:
+        print("\n用户中断程序")
+    except Exception as e:
+        print(f"程序执行出错: {e}")
+        crawler.logger.error(f"程序执行出错: {e}")
+
+if __name__ == "__main__":
+    main()
