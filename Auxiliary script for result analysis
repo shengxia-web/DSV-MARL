@@ -1,0 +1,143 @@
+# results_analyzer.py
+"""
+实验结果分析工具
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+import json
+
+class ResultsAnalyzer:
+    """实验结果分析器"""
+    
+    def __init__(self, results_file: str):
+        self.results_file = results_file
+        self.results = self.load_results()
+        
+    def load_results(self):
+        """加载实验结果"""
+        with open(self.results_file, 'r') as f:
+            return json.load(f)
+    
+    def create_comparison_table(self) -> pd.DataFrame:
+        """创建性能对比表格"""
+        comparison_data = []
+        
+        for model_name, model_results in self.results.items():
+            for seed_result in model_results:
+                metrics = seed_result['final_metrics']
+                metrics['model'] = model_name
+                comparison_data.append(metrics)
+        
+        df = pd.DataFrame(comparison_data)
+        return df
+    
+    def calculate_improvement_percentage(self, baseline_model: str, target_model: str) -> Dict[str, float]:
+        """计算性能改进百分比"""
+        df = self.create_comparison_table()
+        
+        baseline_means = df[df['model'] == baseline_model].mean(numeric_only=True)
+        target_means = df[df['model'] == target_model].mean(numeric_only=True)
+        
+        improvements = {}
+        for metric in ['spearman_correlation', 'mae', 'mse']:
+            if metric in baseline_means and metric in target_means:
+                if 'correlation' in metric:
+                    # 对于相关性指标，值越大越好
+                    improvement = ((target_means[metric] - baseline_means[metric]) / baseline_means[metric]) * 100
+                else:
+                    # 对于误差指标，值越小越好
+                    improvement = ((baseline_means[metric] - target_means[metric]) / baseline_means[metric]) * 100
+                improvements[metric] = improvement
+        
+        return improvements
+    
+    def perform_comprehensive_analysis(self):
+        """执行综合分析"""
+        df = self.create_comparison_table()
+        
+        analysis_results = {
+            'descriptive_stats': df.groupby('model').describe(),
+            'best_performing_model': {},
+            'statistical_significance': {}
+        }
+        
+        # 找出每个指标的最佳模型
+        metrics = ['spearman_correlation', 'mae', 'mse', 'gini_coefficient']
+        for metric in metrics:
+            best_model = df.groupby('model')[metric].mean().idxmax() if 'correlation' in metric else df.groupby('model')[metric].mean().idxmin()
+            analysis_results['best_performing_model'][metric] = best_model
+        
+        # 计算DSV-MARL相对于各基线的改进
+        improvements = {}
+        for baseline in ['StaticShapley', 'IQL', 'VDN', 'COMA']:
+            improvements[baseline] = self.calculate_improvement_percentage(baseline, 'DSV-MARL')
+        analysis_results['improvement_analysis'] = improvements
+        
+        return analysis_results
+    
+    def generate_detailed_report(self, output_file: str = 'detailed_analysis_report.md'):
+        """生成详细分析报告"""
+        analysis = self.perform_comprehensive_analysis()
+        df = self.create_comparison_table()
+        
+        report = f"""# Detailed Experimental Analysis Report
+
+## Overview
+- Total models compared: {len(df['model'].unique())}
+- Total experimental runs: {len(df)}
+- Evaluation metrics: {', '.join([col for col in df.columns if col not in ['model', 'seed', 'evaluation_timestamp']])}
+
+## Performance Ranking
+
+"""
+        
+        # 按指标排序
+        metrics = ['spearman_correlation', 'mae', 'mse']
+        for metric in metrics:
+            ranking = df.groupby('model')[metric].mean().sort_values(ascending=('correlation' in metric))
+            report += f"### {metric.replace('_', ' ').title()}\n"
+            for i, (model, value) in enumerate(ranking.items(), 1):
+                report += f"{i}. {model}: {value:.4f}\n"
+            report += "\n"
+        
+        # DSV-MARL改进分析
+        report += "## DSV-MARL Performance Improvements\n\n"
+        improvements = analysis['improvement_analysis']
+        
+        for baseline, improvement_data in improvements.items():
+            report += f"### Compared to {baseline}\n"
+            for metric, improvement in improvement_data.items():
+                direction = "increase" if improvement > 0 else "decrease"
+                report += f"- {metric}: {improvement:+.2f}% {direction}\n"
+            report += "\n"
+        
+        # 保存报告
+        with open(output_file, 'w') as f:
+            f.write(report)
+        
+        print(f"Detailed report saved to {output_file}")
+        
+        return report
+
+# 使用示例
+if __name__ == "__main__":
+    analyzer = ResultsAnalyzer('experiment_results/experiment_report.json')
+    
+    # 生成综合分析
+    analysis = analyzer.perform_comprehensive_analysis()
+    print("Comprehensive analysis completed")
+    
+    # 生成详细报告
+    report = analyzer.generate_detailed_report()
+    print("Detailed report generated")
+
+
+
+
+
+
+
+
