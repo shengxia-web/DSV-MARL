@@ -1,0 +1,684 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import List, Tuple, Dict, Optional
+import math
+
+class MonotonicMixingNetwork(nn.Module):
+    """
+    单调混合网络 f_mix
+    用于整合所有智能体的价值信息，确保满足单调性约束
+    """
+    def __init__(self, 
+                 input_dim: int, 
+                 hidden_dims: List[int] = [64, 32],
+                 num_agents: int = 5,
+                 use_monotonic: bool = True):
+        super(MonotonicMixingNetwork, self).__init__()
+        
+        self.num_agents = num_agents
+        self.use_monotonic = use_monotonic
+        
+        # 构建混合网络
+        layers = []
+        current_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            current_dim = hidden_dim
+        
+        # 输出层 - 单个标量值
+        layers.append(nn.Linear(current_dim, 1))
+        
+        self.network = nn.Sequential(*layers)
+        
+        # 单调性权重 - 确保 ∂V_total/∂z_t^i ≥ 0
+        if use_monotonic:
+            self.monotonic_weights = nn.Parameter(torch.ones(num_agents))
+        else:
+            self.register_buffer('monotonic_weights', torch.ones(num_agents))
+            
+    def forward(self, agent_features: torch.Tensor) -> torch.Tensor:
+        """
+        输入: 智能体特征向量 z_t = [z_t^1, z_t^2, ..., z_t^n]
+        输出: 全局价值估计 V_total(z_t)
+        """
+        if self.use_monotonic:
+            # 应用单调性约束: 对输入特征进行单调变换
+            weighted_features = agent_features * F.softplus(self.monotonic_weights)
+            global_value = self.network(weighted_features)
+        else:
+            global_value = self.network(agent_features)
+            
+        return global_value.squeeze(-1)
+
+class DifferentiableShapleyApproximation(nn.Module):
+    """
+    可微分Shapley值近似
+    使用虚拟掩码技术高效计算时间边际贡献
+    """
+    def __init__(self, 
+                 feature_dim: int,
+                 num_agents: int,
+                 hidden_dims: List[int] = [128, 64],
+                 temperature: float = 0.5,
+                 use_monte_carlo: bool = True,
+                 monte_carlo_samples: int = 100):
+        super(DifferentiableShapleyApproximation, self).__init__()
+        
+        self.num_agents = num_agents
+        self.feature_dim = feature_dim
+        self.temperature = temperature
+        self.use_monte_carlo = use_monte_carlo
+        self.monte_carlo_samples = monte_carlo_samples
+        
+        # 全局价值混合网络
+        self.mixing_network = MonotonicMixingNetwork(
+            input_dim=feature_dim * num_agents,
+            hidden_dims=hidden_dims,
+            num_agents=num_agents
+        )
+        
+        # 智能体特征编码网络 (可选)
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(feature_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, feature_dim)
+        )
+        
+        # 预计算掩码矩阵用于高效计算
+        self._precompute_masks()
+        
+    def _precompute_masks(self):
+        """预计算掩码矩阵用于边际贡献计算"""
+        self.mask_cache = {}
+        
+        # 为每个智能体预计算缺席掩码
+        for i in range(self.num_agents):
+            mask = torch.ones(self.num_agents, dtype=torch.float32)
+            mask[i] = 0.0  # 第i个智能体缺席
+            self.mask_cache[f"mask_{i}"] = mask
+            
+        # 全出席掩码
+        self.mask_cache["mask_all"] = torch.ones(self.num_agents, dtype=torch.float32)
+        
+    def _create_differentiable_mask(self, 
+                                  original_mask: torch.Tensor, 
+                                  smoothing: bool = True) -> torch.Tensor:
+        """
+        创建可微分掩码
+        
+        参数:
+            original_mask: 原始二进制掩码
+            smoothing: 是否使用平滑技术
+            
+        返回: 可微分掩码
+        """
+        if not smoothing:
+            return original_mask
+            
+        # 使用Gumbel-Softmax进行可微分掩码近似
+        if self.training:
+            # 训练时添加随机噪声进行平滑
+            noise = torch.randn_like(original_mask) * 0.1
+            smoothed_mask = original_mask + noise
+            # 应用sigmoid和温度参数
+            differentiable_mask = torch.sigmoid(smoothed_mask / self.temperature)
+            return differentiable_mask
+        else:
+            # 评估时使用原始掩码
+            return original_mask
+    
+    def compute_marginal_contribution(self, 
+                                    agent_features: torch.Tensor,
+                                    agent_idx: int,
+                                    batch_size: int = 1) -> torch.Tensor:
+        """
+        计算智能体的边际贡献 MC_t^i
+        
+        MC_t^i = V_total(z_t) - V_total(z_t ⊙ m_{-i})
+        """
+        # 确保特征形状正确 [batch_size, num_agents * feature_dim]
+        if agent_features.dim() == 1:
+            agent_features = agent_features.unsqueeze(0)
+            
+        # 全出席时的全局价值
+        global_value_present = self.mixing_network(agent_features)
+        
+        # 智能体i缺席时的全局价值
+        mask_absent = self.mask_cache[f"mask_{agent_idx}"].to(agent_features.device)
+        mask_absent = self._create_differentiable_mask(mask_absent)
+        
+        # 扩展掩码以匹配特征维度
+        expanded_mask = mask_absent.repeat_interleave(self.feature_dim).unsqueeze(0)
+        if batch_size > 1:
+            expanded_mask = expanded_mask.repeat(batch_size, 1)
+            
+        agent_features_absent = agent_features * expanded_mask
+        global_value_absent = self.mixing_network(agent_features_absent)
+        
+        # 边际贡献
+        marginal_contribution = global_value_present - global_value_absent
+        
+        return marginal_contribution
+    
+    def compute_monte_carlo_shapley(self,
+                                  agent_features: torch.Tensor,
+                                  num_samples: Optional[int] = None) -> torch.Tensor:
+        """
+        使用蒙特卡洛采样计算Shapley值近似
+        当智能体数量较大时使用
+        """
+        if num_samples is None:
+            num_samples = self.monte_carlo_samples
+            
+        batch_size = agent_features.shape[0]
+        shapley_values = torch.zeros(batch_size, self.num_agents, device=agent_features.device)
+        
+        for _ in range(num_samples):
+            # 随机排列智能体顺序
+            permutation = torch.randperm(self.num_agents)
+            
+            # 逐步添加智能体并计算边际贡献
+            current_coalition = torch.zeros(self.num_agents, device=agent_features.device)
+            
+            for j, agent_idx in enumerate(permutation):
+                # 添加智能体agent_idx
+                new_coalition = current_coalition.clone()
+                new_coalition[agent_idx] = 1.0
+                
+                # 计算边际贡献
+                mask_current = self._create_differentiable_mask(current_coalition)
+                mask_new = self._create_differentiable_mask(new_coalition)
+                
+                # 扩展掩码
+                expanded_mask_current = mask_current.repeat_interleave(self.feature_dim).unsqueeze(0)
+                expanded_mask_new = mask_new.repeat_interleave(self.feature_dim).unsqueeze(0)
+                
+                if batch_size > 1:
+                    expanded_mask_current = expanded_mask_current.repeat(batch_size, 1)
+                    expanded_mask_new = expanded_mask_new.repeat(batch_size, 1)
+                
+                # 计算价值
+                value_current = self.mixing_network(agent_features * expanded_mask_current)
+                value_new = self.mixing_network(agent_features * expanded_mask_new)
+                
+                marginal_contrib = value_new - value_current
+                
+                # 累积Shapley值
+                shapley_values[:, agent_idx] += marginal_contrib
+                
+                current_coalition = new_coalition
+        
+        # 平均化
+        shapley_values = shapley_values / num_samples
+        
+        return shapley_values
+    
+    def forward(self, 
+                agent_features: torch.Tensor,
+                method: str = "exact") -> torch.Tensor:
+        """
+        计算所有智能体的Shapley值
+        
+        参数:
+            agent_features: 智能体特征 [batch_size, num_agents * feature_dim]
+            method: 计算方法 ("exact", "monte_carlo")
+            
+        返回: Shapley值 [batch_size, num_agents]
+        """
+        batch_size = agent_features.shape[0]
+        
+        if method == "exact" and self.num_agents <= 8:
+            # 精确计算（仅适用于小规模）
+            return self._compute_exact_shapley(agent_features)
+        else:
+            # 蒙特卡洛近似
+            return self.compute_monte_carlo_shapley(agent_features)
+    
+    def _compute_exact_shapley(self, agent_features: torch.Tensor) -> torch.Tensor:
+        """精确计算Shapley值（仅适用于小规模问题）"""
+        batch_size = agent_features.shape[0]
+        shapley_values = torch.zeros(batch_size, self.num_agents, device=agent_features.device)
+        
+        # 枚举所有可能的联盟
+        total_coalitions = 2 ** self.num_agents
+        
+        for coalition_mask in range(total_coalitions):
+            # 跳过空联盟和全联盟
+            if coalition_mask == 0 or coalition_mask == total_coalitions - 1:
+                continue
+                
+            # 解析联盟掩码
+            coalition = [(coalition_mask >> i) & 1 for i in range(self.num_agents)]
+            coalition_tensor = torch.tensor(coalition, dtype=torch.float32, device=agent_features.device)
+            coalition_size = sum(coalition)
+            
+            # 计算权重因子
+            weight = math.factorial(coalition_size) * math.factorial(self.num_agents - coalition_size - 1)
+            weight /= math.factorial(self.num_agents)
+            
+            # 对于每个不在联盟中的智能体，计算其边际贡献
+            for i in range(self.num_agents):
+                if coalition[i] == 0:  # 智能体i不在当前联盟中
+                    # 包含智能体i的新联盟
+                    new_coalition = coalition_tensor.clone()
+                    new_coalition[i] = 1.0
+                    
+                    # 计算两个联盟的价值
+                    mask_current = self._create_differentiable_mask(coalition_tensor)
+                    mask_new = self._create_differentiable_mask(new_coalition)
+                    
+                    # 扩展掩码
+                    expanded_mask_current = mask_current.repeat_interleave(self.feature_dim).unsqueeze(0)
+                    expanded_mask_new = mask_new.repeat_interleave(self.feature_dim).unsqueeze(0)
+                    
+                    if batch_size > 1:
+                        expanded_mask_current = expanded_mask_current.repeat(batch_size, 1)
+                        expanded_mask_new = expanded_mask_new.repeat(batch_size, 1)
+                    
+                    value_current = self.mixing_network(agent_features * expanded_mask_current)
+                    value_new = self.mixing_network(agent_features * expanded_mask_new)
+                    
+                    marginal_contrib = value_new - value_current
+                    
+                    # 累积到Shapley值
+                    shapley_values[:, i] += weight * marginal_contrib
+        
+        return shapley_values
+
+class DynamicShapleyCreditAssignment(nn.Module):
+    """
+    动态Shapley信用分配机制
+    集成可微分Shapley近似，支持时间维度上的贡献累积
+    """
+    def __init__(self,
+                 feature_dim: int,
+                 num_agents: int,
+                 gamma: float = 0.99,
+                 epsilon: float = 1e-8,
+                 **shapley_kwargs):
+        super(DynamicShapleyCreditAssignment, self).__init__()
+        
+        self.num_agents = num_agents
+        self.feature_dim = feature_dim
+        self.gamma = gamma
+        self.epsilon = epsilon
+        
+        # Shapley值近似器
+        self.shapley_approximator = DifferentiableShapleyApproximation(
+            feature_dim=feature_dim,
+            num_agents=num_agents,
+            **shapley_kwargs
+        )
+        
+        # 时间贡献缓冲区
+        self.contribution_buffer = None
+        self.reset_buffer()
+        
+    def reset_buffer(self):
+        """重置贡献缓冲区"""
+        self.contribution_buffer = {
+            'marginal_contributions': [],
+            'discounted_returns': [],
+            'time_steps': []
+        }
+    
+    def compute_temporal_contributions(self,
+                                     agent_features_sequence: List[torch.Tensor],
+                                     rewards: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        计算时间维度上的动态Shapley贡献
+        
+        Φ_i = Σ_{t=0}^T γ^t MC_t^i
+        
+        参数:
+            agent_features_sequence: 时间序列上的智能体特征 [T, batch_size, num_agents * feature_dim]
+            rewards: 奖励序列（可选，用于验证）
+            
+        返回: 总贡献 [batch_size, num_agents]
+        """
+        T = len(agent_features_sequence)
+        batch_size = agent_features_sequence[0].shape[0]
+        
+        # 初始化贡献累积
+        total_contributions = torch.zeros(batch_size, self.num_agents, 
+                                        device=agent_features_sequence[0].device)
+        
+        # 清空缓冲区
+        self.reset_buffer()
+        
+        # 反向计算时间贡献（更稳定）
+        future_contributions = torch.zeros(batch_size, self.num_agents, 
+                                         device=agent_features_sequence[0].device)
+        
+        for t in reversed(range(T)):
+            # 获取当前时间步的特征
+            current_features = agent_features_sequence[t]
+            
+            # 计算边际贡献 MC_t^i
+            if self.shapley_approximator.use_monte_carlo and self.num_agents > 8:
+                marginal_contributions = self.shapley_approximator.compute_monte_carlo_shapley(
+                    current_features)
+            else:
+                marginal_contributions = torch.stack([
+                    self.shapley_approximator.compute_marginal_contribution(
+                        current_features, i, batch_size)
+                    for i in range(self.num_agents)
+                ], dim=1)
+            
+            # 累积折扣贡献
+            current_contributions = marginal_contributions + self.gamma * future_contributions
+            future_contributions = current_contributions
+            
+            # 存储到缓冲区
+            self.contribution_buffer['marginal_contributions'].append(
+                marginal_contributions.detach().cpu())
+            self.contribution_buffer['discounted_returns'].append(
+                current_contributions.detach().cpu())
+            self.contribution_buffer['time_steps'].append(t)
+        
+        # 总贡献是初始时间步的折扣回报
+        total_contributions = future_contributions
+        
+        return total_contributions
+    
+    def allocate_personalized_rewards(self,
+                                   global_reward: torch.Tensor,
+                                   contributions: torch.Tensor,
+                                   allow_negative: bool = True) -> torch.Tensor:
+        """
+        基于贡献分配个性化奖励
+        
+        r_i = R • Φ_i / (Σ_j max(Φ_j, 0) + ε)
+        
+        参数:
+            global_reward: 全局奖励 [batch_size]
+            contributions: 智能体贡献 [batch_size, num_agents]
+            allow_negative: 是否允许负奖励
+            
+        返回: 个性化奖励 [batch_size, num_agents]
+        """
+        batch_size = global_reward.shape[0]
+        
+        if allow_negative:
+            # 允许负贡献参与分配
+            denominator = torch.sum(contributions, dim=1, keepdim=True)
+        else:
+            # 只允许正贡献参与分配
+            denominator = torch.sum(F.relu(contributions), dim=1, keepdim=True)
+        
+        # 添加平滑因子防止除零
+        denominator = denominator + self.epsilon
+        
+        # 计算分配权重
+        allocation_weights = contributions / denominator
+        
+        # 扩展全局奖励维度以进行广播
+        global_reward_expanded = global_reward.unsqueeze(1)  # [batch_size, 1]
+        
+        # 计算个性化奖励
+        personalized_rewards = global_reward_expanded * allocation_weights
+        
+        return personalized_rewards
+    
+    def compute_advantage(self,
+                        personalized_rewards: torch.Tensor,
+                        state_values: torch.Tensor,
+                        next_state_values: torch.Tensor,
+                        dones: torch.Tensor) -> torch.Tensor:
+        """
+        计算优势函数用于策略梯度
+        
+        A_i(S_t, a_t^i) = r_i + γ V_i(S_{t+1}) - V_i(S_t)
+        """
+        # 计算TD目标
+        td_target = personalized_rewards + self.gamma * next_state_values * (1 - dones.float())
+        
+        # 计算优势
+        advantage = td_target - state_values
+        
+        return advantage
+
+class IntegratedCreditAssignment(nn.Module):
+    """
+    集成信用分配和策略学习的完整框架
+    对应论文3.3.2节的描述
+    """
+    def __init__(self,
+                 state_dim: int,
+                 feature_dim: int,
+                 num_agents: int,
+                 gamma: float = 0.99,
+                 **shapley_kwargs):
+        super(IntegratedCreditAssignment, self).__init__()
+        
+        self.state_dim = state_dim
+        self.feature_dim = feature_dim
+        self.num_agents = num_agents
+        self.gamma = gamma
+        
+        # 动态Shapley信用分配
+        self.credit_assignment = DynamicShapleyCreditAssignment(
+            feature_dim=feature_dim,
+            num_agents=num_agents,
+            gamma=gamma,
+            **shapley_kwargs
+        )
+        
+        # 特征提取网络（从状态中提取智能体特征）
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, feature_dim * num_agents)
+        )
+        
+    def extract_agent_features(self, states: torch.Tensor) -> torch.Tensor:
+        """
+        从状态中提取智能体特征
+        
+        参数:
+            states: 状态张量 [batch_size, state_dim]
+            
+        返回: 智能体特征 [batch_size, num_agents * feature_dim]
+        """
+        return self.feature_extractor(states)
+    
+    def compute_credits_and_rewards(self,
+                                  state_sequence: List[torch.Tensor],
+                                  global_reward: torch.Tensor,
+                                  allow_negative_rewards: bool = True) -> Dict[str, torch.Tensor]:
+        """
+        计算信用和个性化奖励
+        
+        参数:
+            state_sequence: 状态序列 [T, batch_size, state_dim]
+            global_reward: 全局奖励 [batch_size]
+            allow_negative_rewards: 是否允许负奖励
+            
+        返回: 包含各种输出的字典
+        """
+        # 提取智能体特征序列
+        feature_sequence = [self.extract_agent_features(state) for state in state_sequence]
+        
+        # 计算动态Shapley贡献
+        contributions = self.credit_assignment.compute_temporal_contributions(feature_sequence)
+        
+        # 分配个性化奖励
+        personalized_rewards = self.credit_assignment.allocate_personalized_rewards(
+            global_reward, contributions, allow_negative_rewards)
+        
+        return {
+            'contributions': contributions,  # Φ_i
+            'personalized_rewards': personalized_rewards,  # r_i
+            'feature_sequence': feature_sequence
+        }
+    
+    def update_policy(self,
+                    policy_networks: List[nn.Module],
+                    state_sequence: List[torch.Tensor],
+                    action_sequence: List[torch.Tensor],
+                    global_reward: torch.Tensor,
+                    next_state: torch.Tensor,
+                    done: torch.Tensor,
+                    optimizer: torch.optim.Optimizer) -> Dict[str, float]:
+        """
+        使用信用分配信号更新策略网络
+        
+        对应论文中的策略梯度更新:
+        ∇_{θ_i} J(π_i) ≈ E[∇_{θ_i} log π_i(a_t^i | S_t) • A_i(S_t, a_t^i)]
+        """
+        # 计算信用和个性化奖励
+        credit_info = self.compute_credits_and_rewards(state_sequence, global_reward)
+        personalized_rewards = credit_info['personalized_rewards']
+        
+        # 为每个智能体计算损失并更新
+        losses = {}
+        
+        for i, policy_net in enumerate(policy_networks):
+            # 获取当前智能体的个性化奖励
+            agent_rewards = personalized_rewards[:, i]  # [batch_size]
+            
+            # 计算价值损失
+            # L(φ_i) = E[(r_{i,t} + γ V_i(S_{t+1}) - V_i(S_t))^2]
+            current_states = state_sequence[-1]  # 使用最后状态
+            current_values = policy_net.value_network(current_states).squeeze()
+            next_values = policy_net.value_network(next_state).squeeze()
+            
+            # 计算TD目标和价值损失
+            td_target = agent_rewards + self.gamma * next_values * (1 - done.float())
+            value_loss = F.mse_loss(current_values, td_target.detach())
+            
+            # 计算策略损失
+            # 需要动作的对数概率和优势函数
+            current_actions = action_sequence[-1][i]  # 最后时间步的动作
+            action_dist, _ = policy_net(current_states)
+            log_probs = action_dist.log_prob(current_actions)
+            
+            # 计算优势函数
+            advantage = td_target - current_values
+            
+            # 策略损失
+            policy_loss = -torch.mean(log_probs * advantage.detach())
+            
+            # 总损失
+            total_loss = policy_loss + 0.5 * value_loss
+            
+            # 反向传播和优化
+            optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=0.5)
+            optimizer.step()
+            
+            losses[f'agent_{i}_policy_loss'] = policy_loss.item()
+            losses[f'agent_{i}_value_loss'] = value_loss.item()
+            losses[f'agent_{i}_total_loss'] = total_loss.item()
+        
+        return losses
+
+# 测试代码
+if __name__ == "__main__":
+    # 设置参数
+    batch_size = 32
+    sequence_length = 10
+    state_dim = 50
+    feature_dim = 16
+    num_agents = 5
+    gamma = 0.99
+    
+    print("=== 测试动态可微分Shapley值近似 ===")
+    
+    # 创建信用分配模块
+    credit_assignment = DynamicShapleyCreditAssignment(
+        feature_dim=feature_dim,
+        num_agents=num_agents,
+        gamma=gamma,
+        temperature=0.5,
+        use_monte_carlo=True,
+        monte_carlo_samples=100
+    )
+    
+    # 测试数据
+    feature_sequence = [
+        torch.randn(batch_size, num_agents * feature_dim) 
+        for _ in range(sequence_length)
+    ]
+    
+    global_reward = torch.randn(batch_size)
+    
+    print(f"特征序列长度: {len(feature_sequence)}")
+    print(f"每个特征张量形状: {feature_sequence[0].shape}")
+    print(f"全局奖励形状: {global_reward.shape}")
+    
+    # 测试时间贡献计算
+    contributions = credit_assignment.compute_temporal_contributions(feature_sequence)
+    print(f"\n贡献张量形状: {contributions.shape}")
+    print(f"贡献范围: [{contributions.min():.3f}, {contributions.max():.3f}]")
+    print(f"平均贡献: {contributions.mean():.3f} ± {contributions.std():.3f}")
+    
+    # 测试个性化奖励分配
+    personalized_rewards = credit_assignment.allocate_personalized_rewards(
+        global_reward, contributions, allow_negative=True)
+    
+    print(f"\n个性化奖励形状: {personalized_rewards.shape}")
+    print(f"奖励分配验证 - 总和: {personalized_rewards.sum(dim=1).mean():.3f}")
+    print(f"个性化奖励范围: [{personalized_rewards.min():.3f}, {personalized_rewards.max():.3f}]")
+    
+    # 测试蒙特卡洛Shapley计算
+    test_features = torch.randn(batch_size, num_agents * feature_dim)
+    mc_shapley = credit_assignment.shapley_approximator.compute_monte_carlo_shapley(
+        test_features, num_samples=50)
+    
+    print(f"\n蒙特卡洛Shapley值形状: {mc_shapley.shape}")
+    print(f"MC Shapley范围: [{mc_shapley.min():.3f}, {mc_shapley.max():.3f}]")
+    
+    # 测试边际贡献计算
+    marginal_contribs = []
+    for i in range(num_agents):
+        mc = credit_assignment.shapley_approximator.compute_marginal_contribution(
+            test_features, i, batch_size)
+        marginal_contribs.append(mc)
+    
+    marginal_contribs = torch.stack(marginal_contribs, dim=1)
+    print(f"\n边际贡献形状: {marginal_contribs.shape}")
+    print(f"边际贡献与MC Shapley差异: {torch.abs(marginal_contribs - mc_shapley).mean():.6f}")
+    
+    # 测试集成框架
+    print("\n=== 测试集成信用分配框架 ===")
+    
+    integrated_credit = IntegratedCreditAssignment(
+        state_dim=state_dim,
+        feature_dim=feature_dim,
+        num_agents=num_agents,
+        gamma=gamma
+    )
+    
+    # 测试状态序列
+    state_sequence = [torch.randn(batch_size, state_dim) for _ in range(sequence_length)]
+    
+    credit_info = integrated_credit.compute_credits_and_rewards(
+        state_sequence, global_reward)
+    
+    print(f"集成框架输出:")
+    for key, value in credit_info.items():
+        if isinstance(value, torch.Tensor):
+            print(f"  {key}: {value.shape}")
+        elif isinstance(value, list):
+            print(f"  {key}: 列表长度 {len(value)}, 元素形状 {value[0].shape}")
+    
+    # 参数统计
+    total_params = sum(p.numel() for p in credit_assignment.parameters())
+    trainable_params = sum(p.numel() for p in credit_assignment.parameters() if p.requires_grad)
+    
+    print(f"\n=== 信用分配网络参数统计 ===")
+    print(f"总参数数量: {total_params:,}")
+    print(f"可训练参数数量: {trainable_params:,}")
+    
+    # 测试不同温度参数的影响
+    print("\n=== 测试温度参数影响 ===")
+    for temp in [0.1, 0.5, 1.0, 2.0]:
+        credit_assignment.shapley_approximator.temperature = temp
+        contributions_temp = credit_assignment.compute_temporal_contributions(feature_sequence[:3])
+        print(f"温度 {temp}: 贡献标准差 = {contributions_temp.std():.4f}")
