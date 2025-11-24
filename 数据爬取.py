@@ -22,8 +22,8 @@ import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ========== 配置 ==========
-BASE_URL = "https://youe.example.com/"  # 替换为真实数据源（示例）
-LIST_PAGE_PATH = "/data-service?page={}"   # 列表页路径模板（示例）
+BASE_URL = "https://youe.example.com/" 
+LIST_PAGE_PATH = "/data-service?page={}"  
 MAX_PAGES = 100
 TARGET_RECORDS = 3782
 REQUESTS_PER_SECOND = 1.0
@@ -439,3 +439,4 @@ if __name__ == "__main__":
     # 预处理与划分
     res = preprocess_dataframe(raw_df, save_prefix=OUTPUT_DIR)
     logging.info("处理完成，输出位于：%s", OUTPUT_DIR)
+
